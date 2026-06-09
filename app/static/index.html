@@ -543,7 +543,97 @@ function log(msg, type = "info") {
 }
 
 // ── init ─────────────────────────────────────────────────────────────────────
+async function restoreState() {
+  try {
+    const [qRes, sRes] = await Promise.all([fetch("/queue"), fetch("/status")]);
+    const qData = await qRes.json();
+    const sData = await sRes.json();
+
+    if (!qData.queue || !qData.queue.length) return;
+
+    files = qData.queue.map(f => ({
+      path: f.path, name: f.name, size_gb: f.size_gb,
+      bitrate_gb_per_hour: f.bitrate_gb_per_hour,
+      duration_minutes: f.duration_minutes, video_codec: f.video_codec,
+    }));
+    statuses = {};
+    let done = 0, saved = 0;
+    qData.queue.forEach(f => {
+      statuses[f.path] = { status: f.status || "queued", percent: f.percent || 0, saved_gb: f.saved_gb || null };
+      if (f.status === "done") { done++; saved += f.saved_gb || 0; }
+    });
+    doneCount = done;
+    totalSaved = saved;
+
+    document.getElementById("s-scanned").textContent = files.length;
+    document.getElementById("s-above").textContent = files.length;
+    document.getElementById("s-done").textContent = done;
+    document.getElementById("s-saved").textContent = saved.toFixed(2) + " GB";
+    document.getElementById("table-label").textContent = files.length + " file(s) above threshold";
+    document.getElementById("btn-queue-all").disabled = false;
+    document.getElementById("btn-start").disabled = false;
+    renderTable();
+    log("Restored previous session state.", "info");
+
+    if (sData.encoding) {
+      log("Encode in progress — reconnecting...", "warn");
+      const crf = document.getElementById("opt-crf").value;
+      const encoder = document.getElementById("opt-encoder").value;
+      const naming = document.getElementById("opt-naming").value;
+      const workers = document.getElementById("opt-workers").value;
+      eventSource = new EventSource("/encode/stream?crf=" + crf + "&encoder=" + encoder + "&naming=" + naming + "&workers=" + workers);
+      document.getElementById("btn-start").disabled = true;
+      document.getElementById("btn-cancel").disabled = false;
+      document.getElementById("btn-scan").disabled = true;
+      eventSource.onmessage = e => {
+        const ev = JSON.parse(e.data);
+        if (ev.type === "progress") {
+          if (!statuses[ev.path]) statuses[ev.path] = {};
+          statuses[ev.path].status = "encoding";
+          statuses[ev.path].percent = ev.percent;
+          statuses[ev.path].eta = fmtEta(ev.eta_seconds);
+          const fill = document.getElementById("prog-" + CSS.escape(ev.path));
+          if (fill) {
+            fill.style.width = ev.percent + "%";
+            const etaEl = document.getElementById("eta-" + CSS.escape(ev.path));
+            if (etaEl) etaEl.textContent = statuses[ev.path].eta + (ev.fps ? "  " + ev.fps + " fps" : "");
+            const row = document.getElementById("row-" + rowId(ev.path));
+            if (row) { const badge = row.querySelector(".badge"); if (badge) { badge.className = "badge badge-encoding"; badge.textContent = ev.percent + "%"; } }
+          } else { renderTable(); }
+        } else if (ev.type === "file_done") {
+          statuses[ev.path] = { status: "done", percent: 100, saved_gb: ev.saved_gb };
+          doneCount++; totalSaved += ev.saved_gb || 0;
+          document.getElementById("s-done").textContent = doneCount;
+          document.getElementById("s-saved").textContent = totalSaved.toFixed(2) + " GB";
+          renderTable();
+          log("Done: " + ev.name + " — saved " + ev.saved_gb + " GB (" + ev.ratio + "% smaller)", "ok");
+        } else if (ev.type === "error") {
+          statuses[ev.path] = { status: "error", percent: 0 };
+          renderTable();
+          log("Error: " + (ev.name || ev.path) + " — " + ev.message, "err");
+        } else if (ev.type === "queue_done") {
+          eventSource.close(); eventSource = null;
+          document.getElementById("btn-start").disabled = false;
+          document.getElementById("btn-cancel").disabled = true;
+          document.getElementById("btn-scan").disabled = false;
+          log("Queue complete. Total saved: " + ev.total_saved_gb + " GB", "ok");
+        }
+      };
+      eventSource.onerror = () => {
+        if (eventSource) { eventSource.close(); eventSource = null; }
+        document.getElementById("btn-start").disabled = false;
+        document.getElementById("btn-cancel").disabled = true;
+        document.getElementById("btn-scan").disabled = false;
+        log("SSE connection closed.", "warn");
+      };
+    }
+  } catch(e) {
+    log("State restore failed: " + e.message, "warn");
+  }
+}
+
 renderFolders();
+restoreState();
 </script>
 </body>
 </html>
