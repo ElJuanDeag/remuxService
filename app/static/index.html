@@ -111,8 +111,9 @@
   .empty-row td { text-align: center; color: var(--muted); padding: 40px; font-size: 13px; }
 
   /* progress bar */
-  .prog-wrap { height: 3px; background: var(--border); border-radius: 2px; margin-top: 5px; overflow: hidden; }
-  .prog-fill { height: 100%; background: var(--accent); border-radius: 2px; transition: width .3s; }
+  .prog-wrap { height: 6px; background: var(--border); border-radius: 3px; margin-top: 6px; overflow: hidden; }
+  .prog-fill { height: 100%; background: var(--accent); border-radius: 3px; transition: width .4s; }
+  .prog-eta { font-size: 10px; color: var(--muted); margin-top: 3px; font-family: var(--mono); }
 
   /* badge */
   .badge { display: inline-block; font-size: 11px; font-weight: 500; padding: 2px 8px; border-radius: 20px; white-space: nowrap; }
@@ -199,9 +200,9 @@
         <div>
           <label>Encoder</label>
           <select id="opt-encoder">
-            <option value="auto" selected>Auto (GPU → CPU)</option>
+            <option value="auto">Auto (GPU → CPU)</option>
             <option value="nvidia">NVIDIA NVENC</option>
-            <option value="cpu">CPU (libx265)</option>
+            <option value="cpu" selected>CPU (libx265)</option>
           </select>
         </div>
         <div>
@@ -211,6 +212,17 @@
             <option value="suffix">Add .remux suffix</option>
             <option value="subdir">Save in /remux dir</option>
           </select>
+        </div>
+      </div>
+
+      <div class="form-row">
+        <label>Parallel workers — <span id="workers-label">1</span> (sequential)</label>
+        <div class="crf-row">
+          <span style="font-size:11px;color:var(--muted)">1</span>
+          <input type="range" id="opt-workers" min="1" max="4" value="1" step="1"
+                 oninput="updateWorkersLabel(this.value)"/>
+          <span style="font-size:11px;color:var(--muted)">4</span>
+          <span class="crf-val" id="workers-val">1</span>
         </div>
       </div>
 
@@ -374,7 +386,7 @@ function renderTable() {
       : st.status;
 
     const prog = st.status === "encoding"
-      ? `<div class="prog-wrap"><div class="prog-fill" id="prog-${CSS.escape(f.path)}" style="width:${st.percent}%"></div></div>`
+      ? `<div class="prog-wrap"><div class="prog-fill" id="prog-${CSS.escape(f.path)}" style="width:${st.percent}%"></div></div><div class="prog-eta" id="eta-${CSS.escape(f.path)}">${st.eta || ""}</div>`
       : "";
 
     const skipBtn = (st.status === "queued")
@@ -418,6 +430,18 @@ async function queueAll() {
   log(`Re-queued ${paths.length} file(s).`, "info");
 }
 
+function updateWorkersLabel(v) {
+  document.getElementById("workers-label").textContent = v == 1 ? "1 (sequential)" : v;
+  document.getElementById("workers-val").textContent = v;
+}
+
+function fmtEta(secs) {
+  if (secs == null || secs < 0) return "";
+  if (secs < 60) return `ETA ${secs}s`;
+  const m = Math.floor(secs / 60), s = secs % 60;
+  return `ETA ${m}m ${s}s`;
+}
+
 // ── encode ───────────────────────────────────────────────────────────────────
 function startEncode() {
   if (eventSource) return;
@@ -425,14 +449,15 @@ function startEncode() {
   const crf = document.getElementById("opt-crf").value;
   const encoder = document.getElementById("opt-encoder").value;
   const naming = document.getElementById("opt-naming").value;
+  const workers = document.getElementById("opt-workers").value;
 
-  const url = `/encode/stream?crf=${crf}&encoder=${encoder}&naming=${naming}`;
+  const url = `/encode/stream?crf=${crf}&encoder=${encoder}&naming=${naming}&workers=${workers}`;
   eventSource = new EventSource(url);
 
   document.getElementById("btn-start").disabled = true;
   document.getElementById("btn-cancel").disabled = false;
   document.getElementById("btn-scan").disabled = true;
-  log(`Starting encode — encoder=${encoder}  crf=${crf}  naming=${naming}`, "info");
+  log(`Starting encode — encoder=${encoder}  crf=${crf}  naming=${naming}  workers=${workers}`, "info");
 
   eventSource.onmessage = e => {
     const ev = JSON.parse(e.data);
@@ -441,10 +466,13 @@ function startEncode() {
       if (!statuses[ev.path]) statuses[ev.path] = {};
       statuses[ev.path].status = "encoding";
       statuses[ev.path].percent = ev.percent;
+      statuses[ev.path].eta = fmtEta(ev.eta_seconds);
       // fast path: only update the fill bar and badge, not full table
       const fill = document.getElementById(`prog-${CSS.escape(ev.path)}`);
       if (fill) {
         fill.style.width = ev.percent + "%";
+        const etaEl = document.getElementById(`eta-${CSS.escape(ev.path)}`);
+        if (etaEl) etaEl.textContent = statuses[ev.path].eta + (ev.fps ? `  ${ev.fps} fps` : "");
         const row = document.getElementById(`row-${rowId(ev.path)}`);
         if (row) {
           const badge = row.querySelector(".badge");
@@ -453,7 +481,6 @@ function startEncode() {
       } else {
         renderTable();
       }
-      log(`[${ev.name}] ${ev.percent}%`, "prog");
     }
 
     else if (ev.type === "file_done") {
