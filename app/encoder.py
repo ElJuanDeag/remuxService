@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import shutil
 from pathlib import Path
 from typing import AsyncGenerator, Optional
 
@@ -8,7 +7,6 @@ from .scanner import VideoFile, probe_file
 
 log = logging.getLogger(__name__)
 
-# Active ffmpeg process — kept module-level so cancel can reach it
 _active_proc: Optional[asyncio.subprocess.Process] = None
 
 
@@ -30,8 +28,6 @@ async def pick_encoder(preference: str) -> tuple[str, list[str]]:
         return "hevc_nvenc", ["-rc", "vbr", "-cq", "0"]
     if preference == "cpu":
         return "libx265", []
-
-    # auto
     if await detect_nvenc():
         log.info("GPU encoder detected: hevc_nvenc")
         return "hevc_nvenc", ["-rc", "vbr", "-cq", "0"]
@@ -55,57 +51,6 @@ def _output_path(source: Path, naming: str) -> Path:
     raise ValueError(f"Unknown naming: {naming}")
 
 
-def _build_stream_args(streams: list[dict]) -> list[str]:
-    """
-    Build explicit per-stream codec args from probe data.
-    - Video: will be set separately by the caller
-    - Audio: copy all tracks
-    - Subtitles: copy if MKV-safe (subrip/ass/ssa/hdmv_pgs), else convert to srt, drop dvb_teletext
-    - Data/attachments: copy
-    MKV-safe subtitle codecs that copy cleanly:
-      subrip (srt), ass, ssa, hdmv_pgs_subtitle, dvd_subtitle, webvtt
-    """
-    SAFE_SUB_COPY = {"subrip", "ass", "ssa", "hdmv_pgs_subtitle", "dvd_subtitle", "webvtt", "mov_text"}
-    DROP_SUB = {"dvb_teletext", "dvb_subtitle"}
-
-    args = ["-map", "0:v:0"]   # first video stream only
-
-    # audio: map all, copy
-    audio_streams = [s for s in streams if s.get("codec_type") == "audio"]
-    for i in range(len(audio_streams)):
-        args += [f"-map", f"0:a:{i}"]
-    if audio_streams:
-        args += ["-c:a", "copy"]
-
-    # subtitles: map selectively
-    sub_streams = [s for s in streams if s.get("codec_type") == "subtitle"]
-    mapped_subs = 0
-    sub_codec_args = []
-    for i, s in enumerate(sub_streams):
-        codec = s.get("codec_name", "").lower()
-        if codec in DROP_SUB:
-            log.debug("Dropping subtitle stream %d (%s)", i, codec)
-            continue
-        args += ["-map", f"0:s:{i}"]
-        if codec in SAFE_SUB_COPY:
-            sub_codec_args += [f"-c:s:{mapped_subs}", "copy"]
-        else:
-            log.debug("Converting subtitle stream %d (%s) → srt", i, codec)
-            sub_codec_args += [f"-c:s:{mapped_subs}", "srt"]
-        mapped_subs += 1
-
-    args += sub_codec_args
-
-    # attachments / data
-    data_streams = [s for s in streams if s.get("codec_type") in ("data", "attachment")]
-    for i in range(len(data_streams)):
-        args += ["-map", f"0:d:{i}"]
-    if data_streams:
-        args += ["-c:d", "copy"]
-
-    return args
-
-
 async def encode_file(
     vf: VideoFile,
     encoder: str,
@@ -119,15 +64,16 @@ async def encode_file(
     tmp = _tmp_path(source)
     final = _output_path(source, naming)
 
-    stream_args = _build_stream_args(vf.streams)
-
+    # Simple and proven: copy everything, only re-encode video.
+    # -map 0 preserves all streams (audio, all subtitle tracks, attachments).
+    # -c copy sets default to passthrough, then we override video only.
     cmd = [
         "ffmpeg", "-hide_banner", "-y",
         "-i", str(source),
+        "-map", "0",
+        "-c", "copy",           # passthrough everything by default
+        "-c:v", encoder,        # then override video stream
     ]
-
-    cmd += stream_args
-    cmd += ["-c:v", encoder]
 
     if encoder == "hevc_nvenc":
         cmd += encoder_extra + ["-cq", str(crf)]
@@ -141,7 +87,7 @@ async def encode_file(
     ]
 
     log.info("Encoding: %s  encoder=%s  crf=%d", source.name, encoder, crf)
-    log.debug("Command: %s", " ".join(cmd))
+    log.info("Command: %s", " ".join(cmd))
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -158,7 +104,6 @@ async def encode_file(
     out_time_us = 0
     stderr_lines: list[str] = []
 
-    # Drain stderr concurrently so it never blocks stdout
     async def drain_stderr():
         async for raw in proc.stderr:
             line = raw.decode("utf-8", errors="ignore").rstrip()
@@ -166,7 +111,6 @@ async def encode_file(
 
     stderr_task = asyncio.create_task(drain_stderr())
 
-    # Read ffmpeg -progress pipe:1 output (key=value lines)
     try:
         async for raw_line in proc.stdout:
             line = raw_line.decode("utf-8", errors="ignore").strip()
@@ -186,7 +130,6 @@ async def encode_file(
                     "name": vf.name,
                     "percent": percent,
                 }
-
             elif key == "progress" and val == "end":
                 break
 
@@ -204,12 +147,13 @@ async def encode_file(
 
     if proc.returncode not in (0, None):
         tmp.unlink(missing_ok=True)
-        # Surface the last meaningful ffmpeg error line
+        # Find last meaningful error line from stderr
         error_detail = next(
-            (l for l in reversed(stderr_lines) if l.strip() and not l.startswith("frame=")),
+            (l for l in reversed(stderr_lines)
+             if l.strip() and not l.startswith("frame=") and not l.startswith("Press")),
             f"ffmpeg exit {proc.returncode}"
         )
-        log.error("ffmpeg failed for %s:\n%s", source.name, "\n".join(stderr_lines[-20:]))
+        log.error("ffmpeg failed for %s:\n%s", source.name, "\n".join(stderr_lines[-30:]))
         yield {"type": "error", "path": vf.path, "message": error_detail}
         return
 
