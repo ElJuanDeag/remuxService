@@ -23,16 +23,18 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# ── defaults ──────────────────────────────────────────────────────────────────
 DEFAULT_FOLDERS   = ["/media/movies"]
 DEFAULT_THRESHOLD = 2.0
 DEFAULT_DEPTH     = 2
 DEFAULT_CRF       = 23
-DEFAULT_ENCODER   = "cpu"
+DEFAULT_ENCODER   = "auto"
 DEFAULT_NAMING    = "replace"
 
-_scan_results: dict[str, VideoFile] = {}
-_queue: list[str] = []
-_status: dict[str, dict] = {}
+# ── in-memory queue ───────────────────────────────────────────────────────────
+_scan_results: dict[str, VideoFile] = {}   # path → VideoFile
+_queue: list[str] = []                     # ordered list of paths
+_status: dict[str, dict] = {}              # path → {status, percent, saved_gb}
 _encode_lock = asyncio.Lock()
 
 app = FastAPI(title="Remux Service")
@@ -41,6 +43,7 @@ static_dir = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
 
+# ── request / response models ─────────────────────────────────────────────────
 class ScanRequest(BaseModel):
     folders: list[str] = DEFAULT_FOLDERS
     threshold_gb_hr: float = DEFAULT_THRESHOLD
@@ -55,6 +58,7 @@ class EncodeStartRequest(BaseModel):
     naming: str = DEFAULT_NAMING
 
 
+# ── routes ────────────────────────────────────────────────────────────────────
 @app.get("/", response_class=HTMLResponse)
 async def index():
     html = (static_dir / "index.html").read_text(encoding="utf-8")
@@ -122,9 +126,12 @@ async def encode_cancel():
     await cancel_encode()
     return {"cancelled": True}
 
+
+
 @app.get("/status")
 async def get_status():
     return {"encoding": _encode_lock.locked()}
+
 
 @app.get("/encode/stream")
 async def encode_stream(
@@ -169,11 +176,13 @@ async def encode_stream(
                             _status[path]["status"] = "error"
                         await event_queue.put(event)
 
+            # launch all tasks
             for path in pending:
                 task = asyncio.create_task(encode_one(path))
                 active_tasks.add(task)
                 task.add_done_callback(active_tasks.discard)
 
+            # drain events until all tasks finish
             while active_tasks or not event_queue.empty():
                 try:
                     event = await asyncio.wait_for(event_queue.get(), timeout=0.2)
@@ -197,6 +206,38 @@ async def encode_stream(
 
 def _sse(data: dict) -> str:
     return f"data: {json.dumps(data)}\n\n"
+
+
+@app.get("/progress/stream")
+async def progress_stream():
+    async def generator():
+        sent_done: set = set()
+        while _encode_lock.locked():
+            for p, s in list(_status.items()):
+                vf = _scan_results.get(p)
+                if not vf:
+                    continue
+                if s.get("status") == "encoding":
+                    yield _sse({"type": "progress", "path": p, "name": vf.name,
+                                "percent": s.get("percent", 0), "eta_seconds": None, "fps": 0})
+                elif s.get("status") == "done" and p not in sent_done:
+                    sent_done.add(p)
+                    yield _sse({"type": "file_done", "path": p, "name": vf.name,
+                                "saved_gb": s.get("saved_gb"), "ratio": 0, "percent": 100})
+                elif s.get("status") == "error" and p not in sent_done:
+                    sent_done.add(p)
+                    yield _sse({"type": "error", "path": p, "name": vf.name, "message": "encoding failed"})
+            await asyncio.sleep(1)
+        yield _sse({"type": "queue_done", "total_saved_gb": round(
+            sum(s.get("saved_gb") or 0 for s in _status.values()), 2)})
+    return StreamingResponse(generator(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.post("/encode/cancel")
+async def encode_cancel():
+    await cancel_encode()
+    return {"cancelled": True}
 
 
 class ProbeRawRequest(BaseModel):
@@ -254,4 +295,3 @@ async def probe_raw(req: ProbeRawRequest):
         "streams": streams_summary,
         "ffmpeg_stderr": ffmpeg_stderr,
     }
-
