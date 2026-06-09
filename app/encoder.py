@@ -64,15 +64,12 @@ async def encode_file(
     tmp = _tmp_path(source)
     final = _output_path(source, naming)
 
-    # Simple and proven: copy everything, only re-encode video.
-    # -map 0 preserves all streams (audio, all subtitle tracks, attachments).
-    # -c copy sets default to passthrough, then we override video only.
     cmd = [
         "ffmpeg", "-hide_banner", "-y",
         "-i", str(source),
         "-map", "0",
-        "-c", "copy",           # passthrough everything by default
-        "-c:v", encoder,        # then override video stream
+        "-c", "copy",
+        "-c:v", encoder,
     ]
 
     if encoder == "hevc_nvenc":
@@ -102,7 +99,9 @@ async def encode_file(
 
     duration = vf.duration_seconds
     out_time_us = 0
+    fps = 0.0
     stderr_lines: list[str] = []
+    start_time = asyncio.get_event_loop().time()
 
     async def drain_stderr():
         async for raw in proc.stderr:
@@ -118,17 +117,30 @@ async def encode_file(
                 continue
             key, _, val = line.partition("=")
 
+            if key == "fps":
+                try:
+                    fps = float(val)
+                except ValueError:
+                    pass
+
             if key == "out_time_us":
                 try:
                     out_time_us = int(val)
                 except ValueError:
                     pass
                 percent = min(int(out_time_us / 1_000_000 / duration * 100), 99) if duration else 0
+                elapsed = asyncio.get_event_loop().time() - start_time
+                encoded_secs = out_time_us / 1_000_000
+                remaining_secs = max(duration - encoded_secs, 0) if duration else 0
+                eta_seconds = int(remaining_secs / fps) if fps > 0 else None
                 yield {
                     "type": "progress",
                     "path": vf.path,
                     "name": vf.name,
                     "percent": percent,
+                    "elapsed_seconds": int(elapsed),
+                    "eta_seconds": eta_seconds,
+                    "fps": round(fps, 1),
                 }
             elif key == "progress" and val == "end":
                 break
@@ -147,7 +159,6 @@ async def encode_file(
 
     if proc.returncode not in (0, None):
         tmp.unlink(missing_ok=True)
-        # Find last meaningful error line from stderr
         error_detail = next(
             (l for l in reversed(stderr_lines)
              if l.strip() and not l.startswith("frame=") and not l.startswith("Press")),
@@ -157,14 +168,12 @@ async def encode_file(
         yield {"type": "error", "path": vf.path, "message": error_detail}
         return
 
-    # Verify output
     verified = await probe_file(tmp)
     if verified is None or verified.duration_seconds < 60:
         tmp.unlink(missing_ok=True)
         yield {"type": "error", "path": vf.path, "message": "output verification failed"}
         return
 
-    # Commit
     new_size = tmp.stat().st_size
     saved_gb = round((vf.size_bytes - new_size) / (1024 ** 3), 2)
     ratio = round((1 - new_size / vf.size_bytes) * 100, 1) if vf.size_bytes else 0
