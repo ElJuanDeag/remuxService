@@ -182,3 +182,66 @@ async def encode_stream(
 
 def _sse(data: dict) -> str:
     return f"data: {json.dumps(data)}\n\n"
+
+
+@app.post("/encode/cancel")
+async def encode_cancel():
+    await cancel_encode()
+    return {"cancelled": True}
+
+
+class ProbeRawRequest(BaseModel):
+    path: str
+
+@app.post("/probe/raw")
+async def probe_raw(req: ProbeRawRequest):
+    probe_cmd = [
+        "ffprobe", "-v", "quiet",
+        "-print_format", "json",
+        "-show_streams", "-show_format",
+        req.path,
+    ]
+    probe_proc = await asyncio.create_subprocess_exec(
+        *probe_cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    probe_out, _ = await probe_proc.communicate()
+    try:
+        probe_data = json.loads(probe_out)
+    except Exception:
+        probe_data = {}
+
+    ffmpeg_cmd = [
+        "ffmpeg", "-hide_banner", "-y",
+        "-i", req.path,
+        "-map", "0", "-c", "copy",
+        "-t", "3", "-f", "null", "-",
+    ]
+    ffmpeg_proc = await asyncio.create_subprocess_exec(
+        *ffmpeg_cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        _, ffmpeg_err = await asyncio.wait_for(ffmpeg_proc.communicate(), timeout=30)
+        ffmpeg_stderr = ffmpeg_err.decode("utf-8", errors="ignore")
+    except asyncio.TimeoutError:
+        ffmpeg_stderr = "timed out"
+
+    streams_summary = [
+        {
+            "index": s.get("index"),
+            "type": s.get("codec_type"),
+            "codec": s.get("codec_name"),
+            "lang": s.get("tags", {}).get("language", ""),
+            "title": s.get("tags", {}).get("title", ""),
+        }
+        for s in probe_data.get("streams", [])
+    ]
+
+    return {
+        "path": req.path,
+        "streams": streams_summary,
+        "ffmpeg_stderr": ffmpeg_stderr,
+    }
