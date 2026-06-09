@@ -581,7 +581,7 @@ async function restoreState() {
       const encoder = document.getElementById("opt-encoder").value;
       const naming = document.getElementById("opt-naming").value;
       const workers = document.getElementById("opt-workers").value;
-      eventSource = new EventSource("/encode/stream?crf=" + crf + "&encoder=" + encoder + "&naming=" + naming + "&workers=" + workers);
+      eventSource = new EventSource("/progress/stream");
       document.getElementById("btn-start").disabled = true;
       document.getElementById("btn-cancel").disabled = false;
       document.getElementById("btn-scan").disabled = true;
