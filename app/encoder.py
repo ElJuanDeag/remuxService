@@ -55,6 +55,57 @@ def _output_path(source: Path, naming: str) -> Path:
     raise ValueError(f"Unknown naming: {naming}")
 
 
+def _build_stream_args(streams: list[dict]) -> list[str]:
+    """
+    Build explicit per-stream codec args from probe data.
+    - Video: will be set separately by the caller
+    - Audio: copy all tracks
+    - Subtitles: copy if MKV-safe (subrip/ass/ssa/hdmv_pgs), else convert to srt, drop dvb_teletext
+    - Data/attachments: copy
+    MKV-safe subtitle codecs that copy cleanly:
+      subrip (srt), ass, ssa, hdmv_pgs_subtitle, dvd_subtitle, webvtt
+    """
+    SAFE_SUB_COPY = {"subrip", "ass", "ssa", "hdmv_pgs_subtitle", "dvd_subtitle", "webvtt", "mov_text"}
+    DROP_SUB = {"dvb_teletext", "dvb_subtitle"}
+
+    args = ["-map", "0:v:0"]   # first video stream only
+
+    # audio: map all, copy
+    audio_streams = [s for s in streams if s.get("codec_type") == "audio"]
+    for i in range(len(audio_streams)):
+        args += [f"-map", f"0:a:{i}"]
+    if audio_streams:
+        args += ["-c:a", "copy"]
+
+    # subtitles: map selectively
+    sub_streams = [s for s in streams if s.get("codec_type") == "subtitle"]
+    mapped_subs = 0
+    sub_codec_args = []
+    for i, s in enumerate(sub_streams):
+        codec = s.get("codec_name", "").lower()
+        if codec in DROP_SUB:
+            log.debug("Dropping subtitle stream %d (%s)", i, codec)
+            continue
+        args += ["-map", f"0:s:{i}"]
+        if codec in SAFE_SUB_COPY:
+            sub_codec_args += [f"-c:s:{mapped_subs}", "copy"]
+        else:
+            log.debug("Converting subtitle stream %d (%s) → srt", i, codec)
+            sub_codec_args += [f"-c:s:{mapped_subs}", "srt"]
+        mapped_subs += 1
+
+    args += sub_codec_args
+
+    # attachments / data
+    data_streams = [s for s in streams if s.get("codec_type") in ("data", "attachment")]
+    for i in range(len(data_streams)):
+        args += ["-map", f"0:d:{i}"]
+    if data_streams:
+        args += ["-c:d", "copy"]
+
+    return args
+
+
 async def encode_file(
     vf: VideoFile,
     encoder: str,
@@ -68,12 +119,15 @@ async def encode_file(
     tmp = _tmp_path(source)
     final = _output_path(source, naming)
 
+    stream_args = _build_stream_args(vf.streams)
+
     cmd = [
         "ffmpeg", "-hide_banner", "-y",
         "-i", str(source),
-        "-map", "0",
-        "-c:v", encoder,
     ]
+
+    cmd += stream_args
+    cmd += ["-c:v", encoder]
 
     if encoder == "hevc_nvenc":
         cmd += encoder_extra + ["-cq", str(crf)]
@@ -81,15 +135,13 @@ async def encode_file(
         cmd += ["-crf", str(crf), "-preset", "medium"]
 
     cmd += [
-        "-c:a", "copy",
-        "-c:s", "copy",
-        "-c:d", "copy",
         "-progress", "pipe:1",
         "-nostats",
         str(tmp),
     ]
 
     log.info("Encoding: %s  encoder=%s  crf=%d", source.name, encoder, crf)
+    log.debug("Command: %s", " ".join(cmd))
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -104,6 +156,15 @@ async def encode_file(
 
     duration = vf.duration_seconds
     out_time_us = 0
+    stderr_lines: list[str] = []
+
+    # Drain stderr concurrently so it never blocks stdout
+    async def drain_stderr():
+        async for raw in proc.stderr:
+            line = raw.decode("utf-8", errors="ignore").rstrip()
+            stderr_lines.append(line)
+
+    stderr_task = asyncio.create_task(drain_stderr())
 
     # Read ffmpeg -progress pipe:1 output (key=value lines)
     try:
@@ -132,16 +193,24 @@ async def encode_file(
     except asyncio.CancelledError:
         proc.terminate()
         await proc.wait()
+        await stderr_task
         tmp.unlink(missing_ok=True)
         yield {"type": "error", "path": vf.path, "message": "cancelled"}
         return
 
     await proc.wait()
+    await stderr_task
     _active_proc = None
 
     if proc.returncode not in (0, None):
         tmp.unlink(missing_ok=True)
-        yield {"type": "error", "path": vf.path, "message": f"ffmpeg exit {proc.returncode}"}
+        # Surface the last meaningful ffmpeg error line
+        error_detail = next(
+            (l for l in reversed(stderr_lines) if l.strip() and not l.startswith("frame=")),
+            f"ffmpeg exit {proc.returncode}"
+        )
+        log.error("ffmpeg failed for %s:\n%s", source.name, "\n".join(stderr_lines[-20:]))
+        yield {"type": "error", "path": vf.path, "message": error_detail}
         return
 
     # Verify output
