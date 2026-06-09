@@ -1,0 +1,12 @@
+services:
+  remux:
+    build: .
+    container_name: remux-service
+    ports:
+      - "7755:7755"
+    volumes:
+      - /mnt/pve/data0/media:/media:rw
+      - ./logs:/app/logs
+    environment:
+      - MEDIA_ROOT=/media
+    restart: unless-stopped
