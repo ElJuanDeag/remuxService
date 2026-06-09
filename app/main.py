@@ -23,18 +23,16 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── defaults ──────────────────────────────────────────────────────────────────
 DEFAULT_FOLDERS   = ["/media/movies"]
 DEFAULT_THRESHOLD = 2.0
 DEFAULT_DEPTH     = 2
 DEFAULT_CRF       = 23
-DEFAULT_ENCODER   = "auto"
+DEFAULT_ENCODER   = "cpu"
 DEFAULT_NAMING    = "replace"
 
-# ── in-memory queue ───────────────────────────────────────────────────────────
-_scan_results: dict[str, VideoFile] = {}   # path → VideoFile
-_queue: list[str] = []                     # ordered list of paths
-_status: dict[str, dict] = {}              # path → {status, percent, saved_gb}
+_scan_results: dict[str, VideoFile] = {}
+_queue: list[str] = []
+_status: dict[str, dict] = {}
 _encode_lock = asyncio.Lock()
 
 app = FastAPI(title="Remux Service")
@@ -43,7 +41,6 @@ static_dir = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
 
-# ── request / response models ─────────────────────────────────────────────────
 class ScanRequest(BaseModel):
     folders: list[str] = DEFAULT_FOLDERS
     threshold_gb_hr: float = DEFAULT_THRESHOLD
@@ -58,7 +55,6 @@ class EncodeStartRequest(BaseModel):
     naming: str = DEFAULT_NAMING
 
 
-# ── routes ────────────────────────────────────────────────────────────────────
 @app.get("/", response_class=HTMLResponse)
 async def index():
     html = (static_dir / "index.html").read_text(encoding="utf-8")
@@ -132,41 +128,57 @@ async def encode_stream(
     crf: int = DEFAULT_CRF,
     encoder: str = DEFAULT_ENCODER,
     naming: str = DEFAULT_NAMING,
+    workers: int = 1,
 ):
     if _encode_lock.locked():
         raise HTTPException(409, "Encode already running")
 
     enc, enc_args = await pick_encoder(encoder)
+    workers = max(1, min(workers, 8))
 
     async def event_generator():
         async with _encode_lock:
             total_saved = 0.0
+            event_queue: asyncio.Queue = asyncio.Queue()
             pending = [p for p in _queue if _status.get(p, {}).get("status") == "queued"]
 
             if not pending:
                 yield _sse({"type": "queue_done", "total_saved_gb": 0})
                 return
 
-            for path in pending:
+            sem = asyncio.Semaphore(workers)
+            active_tasks: set[asyncio.Task] = set()
+
+            async def encode_one(path: str):
                 vf = _scan_results.get(path)
                 if not vf:
-                    continue
+                    return
+                async with sem:
+                    _status[path]["status"] = "encoding"
+                    async for event in encode_file(vf, enc, enc_args, crf, naming):
+                        if event["type"] == "progress":
+                            _status[path]["percent"] = event.get("percent", 0)
+                        elif event["type"] == "file_done":
+                            _status[path]["status"] = "done"
+                            _status[path]["percent"] = 100
+                            _status[path]["saved_gb"] = event.get("saved_gb", 0)
+                        elif event["type"] == "error":
+                            _status[path]["status"] = "error"
+                        await event_queue.put(event)
 
-                _status[path]["status"] = "encoding"
+            for path in pending:
+                task = asyncio.create_task(encode_one(path))
+                active_tasks.add(task)
+                task.add_done_callback(active_tasks.discard)
 
-                async for event in encode_file(vf, enc, enc_args, crf, naming):
-                    # update in-memory state
-                    if event["type"] == "progress":
-                        _status[path]["percent"] = event.get("percent", 0)
-                    elif event["type"] == "file_done":
-                        _status[path]["status"] = "done"
-                        _status[path]["percent"] = 100
-                        _status[path]["saved_gb"] = event.get("saved_gb", 0)
+            while active_tasks or not event_queue.empty():
+                try:
+                    event = await asyncio.wait_for(event_queue.get(), timeout=0.2)
+                    if event["type"] == "file_done":
                         total_saved += event.get("saved_gb", 0)
-                    elif event["type"] == "error":
-                        _status[path]["status"] = "error"
-
                     yield _sse(event)
+                except asyncio.TimeoutError:
+                    continue
 
             yield _sse({"type": "queue_done", "total_saved_gb": round(total_saved, 2)})
 
@@ -182,12 +194,6 @@ async def encode_stream(
 
 def _sse(data: dict) -> str:
     return f"data: {json.dumps(data)}\n\n"
-
-
-@app.post("/encode/cancel")
-async def encode_cancel():
-    await cancel_encode()
-    return {"cancelled": True}
 
 
 class ProbeRawRequest(BaseModel):
@@ -245,3 +251,4 @@ async def probe_raw(req: ProbeRawRequest):
         "streams": streams_summary,
         "ffmpeg_stderr": ffmpeg_stderr,
     }
+
