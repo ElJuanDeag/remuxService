@@ -122,6 +122,9 @@ async def encode_cancel():
     await cancel_encode()
     return {"cancelled": True}
 
+@app.get("/status")
+async def get_status():
+    return {"encoding": _encode_lock.locked()}
 
 @app.get("/encode/stream")
 async def encode_stream(
